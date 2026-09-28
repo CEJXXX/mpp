@@ -84,6 +84,9 @@ MPP_RET h264e_sei_recovery_point_to_packet(MppPacket packet, RK_S32 *len, RK_U32
     mpp_writer_put_bits(bit, payload_size - i, 8);
 
     write_recovery_point(bit, recovery_frame_cnt);
+    /* rbsp_trailing_bits of the SEI NAL itself; the one inside
+     * write_recovery_point only byte-aligns the payload */
+    mpp_writer_trailing(bit);
 
     sei_size = mpp_writer_bytes(bit);
     if (len)
