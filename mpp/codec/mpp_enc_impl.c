@@ -1036,8 +1036,15 @@ static void proc_h264_cfg(MppEncImpl *enc)
 
         enc->cfg->rc.refresh_length = (mb_rows + enc->cfg->rc.refresh_num - 1) /
                                       enc->cfg->rc.refresh_num;
-        if (enc->cfg->rc.gop < enc->cfg->rc.refresh_length)
-            enc->cfg->rc.refresh_length = enc->cfg->rc.gop;
+        /* one refresh cycle must fit in a gop, otherwise the rows past the
+         * gop are never refreshed and a decoder joining mid-stream never
+         * recovers: raise refresh_num instead of truncating the cycle */
+        if (enc->cfg->rc.gop < enc->cfg->rc.refresh_length) {
+            enc->cfg->rc.refresh_num = (mb_rows + enc->cfg->rc.gop - 1) /
+                                       enc->cfg->rc.gop;
+            enc->cfg->rc.refresh_length = (mb_rows + enc->cfg->rc.refresh_num - 1) /
+                                          enc->cfg->rc.refresh_num;
+        }
     }
 
     if (!flag)
@@ -1092,8 +1099,15 @@ static void proc_h265_cfg(MppEncImpl *enc)
 
         enc->cfg->rc.refresh_length = (mb_rows + enc->cfg->rc.refresh_num - 1) /
                                       enc->cfg->rc.refresh_num;
-        if (enc->cfg->rc.gop < enc->cfg->rc.refresh_length)
-            enc->cfg->rc.refresh_length = enc->cfg->rc.gop;
+        /* one refresh cycle must fit in a gop, otherwise the rows past the
+         * gop are never refreshed and a decoder joining mid-stream never
+         * recovers: raise refresh_num instead of truncating the cycle */
+        if (enc->cfg->rc.gop < enc->cfg->rc.refresh_length) {
+            enc->cfg->rc.refresh_num = (mb_rows + enc->cfg->rc.gop - 1) /
+                                       enc->cfg->rc.gop;
+            enc->cfg->rc.refresh_length = (mb_rows + enc->cfg->rc.refresh_num - 1) /
+                                          enc->cfg->rc.refresh_num;
+        }
     }
 
     if (!flag)
