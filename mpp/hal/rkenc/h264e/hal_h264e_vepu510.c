@@ -1322,15 +1322,13 @@ static MPP_RET setup_vepu510_intra_refresh(HalVepu510RegSet *regs, HalH264eVepu5
     MPP_RET ret = MPP_OK;
     RK_U32 mb_w = ctx->sps->pic_width_in_mbs;
     RK_U32 mb_h = ctx->sps->pic_height_in_mbs;
-    RK_U32 w = mb_w * 16;
-    RK_U32 h = mb_h * 16;
-    MppEncROIRegion *region = NULL;
+    RK_S32 w = mb_w * 16;
+    RK_S32 h = mb_h * 16;
     H264eVepu510Frame *reg_frm = &regs->reg_frm;
-    RK_U32 refresh_num = ctx->cfg->rc.refresh_num;
-    RK_U32 stride_h = MPP_ALIGN(mb_w, 4);
-    RK_U32 stride_v = MPP_ALIGN(mb_h, 4);
-    RK_U32 roir_buf_size = stride_h * stride_v * 8;
-    RK_U32 i = 0;
+    RK_S32 refresh_num = ctx->cfg->rc.refresh_num;
+    MppEncROIRegion region;
+    MppEncROICfg roi_cfg;
+    RK_S32 pos;
 
     hal_h264e_dbg_func("enter\n");
 
@@ -1339,64 +1337,52 @@ static MPP_RET setup_vepu510_intra_refresh(HalVepu510RegSet *regs, HalH264eVepu5
         goto RET;
     }
 
-    if (NULL == ctx->roir_buf) {
-        if (NULL == ctx->roi_grp)
-            mpp_buffer_group_get_internal(&ctx->roi_grp, MPP_BUFFER_TYPE_ION);
-        mpp_buffer_get(ctx->roi_grp, &ctx->roir_buf, roir_buf_size);
-        ctx->roir_buf_size = roir_buf_size;
-    }
-
-    mpp_assert(ctx->roir_buf);
-    void *base_cfg_buf = mpp_buffer_get_ptr(ctx->roir_buf);
-    Vepu510RoiH264BsCfg base_cfg;
-    Vepu510RoiH264BsCfg *base_cfg_ptr = (Vepu510RoiH264BsCfg *)base_cfg_buf;
-
-    base_cfg.force_intra = 0;
-    base_cfg.qp_adj_en   = 1;
-
-    for (i = 0; i < stride_h * stride_v; i++, base_cfg_ptr++)
-        memcpy(base_cfg_ptr, &base_cfg, sizeof(base_cfg));
-
-    region = mpp_calloc(MppEncROIRegion, 1);
-
-    if (NULL == region) {
-        mpp_err_f("Failed to calloc for MppEncROIRegion !\n");
-        ret = MPP_ERR_MALLOC;
-    }
+    /*
+     * vepu510 has no wired per-macroblock force-intra buffer for H.264: the
+     * previous code filled a buffer laid out for vepu580, but adr_roir was never
+     * programmed and bmap never enabled, so nothing was ever refreshed and a
+     * decoder joining mid-stream never recovered. Use the register ROI regions
+     * that the user ROI path already drives.
+     *
+     * Each refresh region reaches two macroblock rows (or columns) back into the
+     * previous one, as before. Compute in signed arithmetic and clip to the
+     * picture: region fields are RK_U16 and used to wrap to 65520.
+     */
+    memset(&region, 0, sizeof(region));
+    pos = (RK_S32)refresh_idx * 16 * refresh_num - (refresh_idx > 0 ? 32 : 0);
 
     if (ctx->cfg->rc.refresh_mode == MPP_ENC_RC_INTRA_REFRESH_ROW) {
-        region->x = 0;
-        region->w = w;
-        if (refresh_idx > 0) {
-            region->y = refresh_idx * 16 * refresh_num - 32;
-            region->h = 16 * refresh_num + 32;
-        } else {
-            region->y = refresh_idx * 16 * refresh_num;
-            region->h = 16 * refresh_num;
-        }
+        RK_S32 end = MPP_MIN((RK_S32)(refresh_idx + 1) * 16 * refresh_num, h);
+
+        pos = MPP_MAX(pos, 0);
+        region.x = 0;
+        region.w = w;
+        region.y = pos;
+        region.h = end - pos;
         reg_frm->common.me_rnge.cime_srch_uph = 1;
-    } else if (ctx->cfg->rc.refresh_mode == MPP_ENC_RC_INTRA_REFRESH_COL) {
-        region->y = 0;
-        region->h = h;
-        if (refresh_idx > 0) {
-            region->x = refresh_idx * 16 * refresh_num - 32;
-            region->w = 16 * refresh_num + 32;
-        } else {
-            region->x = refresh_idx * 16 * refresh_num;
-            region->w = 16 * refresh_num;
-        }
+    } else {
+        RK_S32 end = MPP_MIN((RK_S32)(refresh_idx + 1) * 16 * refresh_num, w);
+
+        pos = MPP_MAX(pos, 0);
+        region.y = 0;
+        region.h = h;
+        region.x = pos;
+        region.w = end - pos;
         reg_frm->common.me_rnge.cime_srch_dwnh = 1;
     }
 
-    region->intra = 1;
-    region->quality = -ctx->cfg->rc.qp_delta_ip;
+    if (region.w <= 0 || region.h <= 0)
+        goto RET;
 
-    region->area_map_en = 1;
-    region->qp_area_idx = 1;
-    region->abs_qp_en = 0;
+    region.intra = 1;
+    region.quality = -ctx->cfg->rc.qp_delta_ip;
+    region.area_map_en = 1;
+    region.qp_area_idx = 1;
+    region.abs_qp_en = 0;
 
-    vepu5xx_h264_set_one_roi(base_cfg_buf, region, w, h);
-    mpp_free(region);
+    roi_cfg.number = 1;
+    roi_cfg.regions = &region;
+    ret = vepu510_set_roi(&regs->reg_rc_roi.roi_cfg, &roi_cfg, w, h);
 RET:
     hal_h264e_dbg_func("leave, ret %d\n", ret);
     return ret;
