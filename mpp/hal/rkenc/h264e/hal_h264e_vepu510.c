@@ -1368,7 +1368,8 @@ static MPP_RET setup_vepu510_intra_refresh(HalVepu510RegSet *regs, HalH264eVepu5
         region.h = h;
         region.x = pos;
         region.w = end - pos;
-        reg_frm->common.me_rnge.cime_srch_dwnh = 1;
+        /* 列刷新从左向右推进，收紧向右的候选窗以限制跨越刷新前沿。 */
+        reg_frm->common.me_rnge.cime_srch_rgtw = 1;
     }
 
     if (region.w <= 0 || region.h <= 0)

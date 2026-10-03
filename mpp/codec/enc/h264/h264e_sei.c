@@ -30,7 +30,8 @@
 static MPP_RET write_recovery_point(MppWriteCtx *bit, RK_U32 recovery_frame_cnt)
 {
     mpp_writer_put_ue(bit, recovery_frame_cnt);
-    mpp_writer_put_bits(bit, 1, 1);
+    /* 在列刷新硬件复验确认前，不对 exact match 作出码流声明。 */
+    mpp_writer_put_bits(bit, 0, 1);
     mpp_writer_put_bits(bit, 0, 1);
     mpp_writer_put_bits(bit, 0, 2);
     mpp_writer_trailing(bit);

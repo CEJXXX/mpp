@@ -1526,7 +1526,9 @@ static MPP_RET setup_vepu580_intra_refresh(HalVepu580RegSet *regs, HalH264eVepu5
             region->x = refresh_idx * 16 * refresh_num;
             region->w = 16 * refresh_num;
         }
+        /* VEPU580 没有左右分向窗；列刷新时对全帧收紧水平 CME/RME 范围。 */
         regs->reg_base.common.me_rnge.cme_srch_h = 1;
+        regs->reg_base.common.me_rnge.rme_srch_h = 3;
     }
 
     region->intra = 1;
