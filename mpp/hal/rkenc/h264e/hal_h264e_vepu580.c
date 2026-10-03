@@ -84,7 +84,8 @@ typedef struct HalH264eVepu580Ctx_t {
     /* roi */
     void                    *roi_data;
     MppBufferGroup          roi_grp;
-    MppBuffer               roi_base_cfg_buf;
+    /* 每个在途任务独立持有 force-intra 图，避免后续帧覆盖。 */
+    MppBuffer               roi_base_cfg_bufs[MAX_TASK_CNT];
     RK_S32                  roi_base_buf_size;
 
     /* osd */
@@ -259,11 +260,13 @@ static MPP_RET hal_h264e_vepu580_deinit(void *hal)
         p->hw_recn = NULL;
     }
 
-    if (p->roi_base_cfg_buf) {
-        mpp_buffer_put(p->roi_base_cfg_buf);
-        p->roi_base_cfg_buf = NULL;
-        p->roi_base_buf_size = 0;
+    for (i = 0; i < p->task_cnt; i++) {
+        if (p->roi_base_cfg_bufs[i]) {
+            mpp_buffer_put(p->roi_base_cfg_bufs[i]);
+            p->roi_base_cfg_bufs[i] = NULL;
+        }
     }
+    p->roi_base_buf_size = 0;
 
     if (p->roi_grp) {
         mpp_buffer_group_put(p->roi_grp);
@@ -1456,7 +1459,8 @@ static void setup_vepu580_io_buf(HalVepu580RegSet *regs, MppDevRegOffCfgs *offse
     hal_h264e_dbg_func("leave\n");
 }
 
-static MPP_RET setup_vepu580_intra_refresh(HalVepu580RegSet *regs, HalH264eVepu580Ctx *ctx, RK_U32 refresh_idx)
+static MPP_RET setup_vepu580_intra_refresh(HalVepu580RegSet *regs, HalH264eVepu580Ctx *ctx,
+                                           RK_U32 refresh_idx, RK_U32 reg_idx)
 {
     MPP_RET ret = MPP_OK;
     RK_U32 mb_w = ctx->sps->pic_width_in_mbs;
@@ -1469,6 +1473,7 @@ static MPP_RET setup_vepu580_intra_refresh(HalVepu580RegSet *regs, HalH264eVepu5
     RK_U32 stride_v = MPP_ALIGN(mb_h, 4);
     RK_S32 roi_base_buf_size = stride_h * stride_v * 8;
     RK_U32 i = 0;
+    MppBuffer roi_base_cfg_buf;
 
     hal_h264e_dbg_func("enter\n");
 
@@ -1477,18 +1482,35 @@ static MPP_RET setup_vepu580_intra_refresh(HalVepu580RegSet *regs, HalH264eVepu5
         goto RET;
     }
 
+    if (reg_idx >= ctx->task_cnt) {
+        ret = MPP_ERR_VALUE;
+        goto RET;
+    }
+
     if (ctx->roi_base_buf_size < roi_base_buf_size) {
-        if (NULL == ctx->roi_grp)
-            mpp_buffer_group_get_internal(&ctx->roi_grp, MPP_BUFFER_TYPE_ION);
-        if (ctx->roi_base_cfg_buf)
-            mpp_buffer_put(ctx->roi_base_cfg_buf);
-        mpp_buffer_get(ctx->roi_grp, &ctx->roi_base_cfg_buf, roi_base_buf_size);
+        if (NULL == ctx->roi_grp) {
+            ret = mpp_buffer_group_get_internal(&ctx->roi_grp, MPP_BUFFER_TYPE_ION);
+            if (ret)
+                goto RET;
+        }
+
+        for (i = 0; i < ctx->task_cnt; i++) {
+            if (ctx->roi_base_cfg_bufs[i]) {
+                mpp_buffer_put(ctx->roi_base_cfg_bufs[i]);
+                ctx->roi_base_cfg_bufs[i] = NULL;
+            }
+
+            ret = mpp_buffer_get(ctx->roi_grp, &ctx->roi_base_cfg_bufs[i], roi_base_buf_size);
+            if (ret)
+                goto RET;
+        }
         ctx->roi_base_buf_size = roi_base_buf_size;
     }
 
-    mpp_assert(ctx->roi_base_cfg_buf);
-    RK_S32 base_cfg_fd = mpp_buffer_get_fd(ctx->roi_base_cfg_buf);
-    void *base_cfg_buf = mpp_buffer_get_ptr(ctx->roi_base_cfg_buf);
+    roi_base_cfg_buf = ctx->roi_base_cfg_bufs[reg_idx];
+    mpp_assert(roi_base_cfg_buf);
+    RK_S32 base_cfg_fd = mpp_buffer_get_fd(roi_base_cfg_buf);
+    void *base_cfg_buf = mpp_buffer_get_ptr(roi_base_cfg_buf);
     Vepu580RoiH264BsCfg base_cfg;
     Vepu580RoiH264BsCfg *base_cfg_ptr = (Vepu580RoiH264BsCfg *)base_cfg_buf;
 
@@ -1517,18 +1539,31 @@ static MPP_RET setup_vepu580_intra_refresh(HalVepu580RegSet *regs, HalH264eVepu5
         }
         regs->reg_base.common.me_rnge.cme_srch_v = 1;
     } else if (ctx->cfg->rc.refresh_mode == MPP_ENC_RC_INTRA_REFRESH_COL) {
+        RK_S32 step_px = (RK_S32)refresh_num * 16;
+        RK_S32 overlap_px = 32;
+        RK_S32 cme_range_px = regs->reg_base.common.me_rnge.cme_srch_h * 16;
+        RK_S32 rme_reserve_px = 16;
+        RK_S32 interp_right_px = 3;
+        RK_S32 guard_px = cme_range_px + rme_reserve_px + interp_right_px -
+                          overlap_px - step_px;
+        RK_S32 start_px = (RK_S32)refresh_idx * step_px - overlap_px;
+        RK_S32 end_px = ((RK_S32)refresh_idx + 1) * step_px;
+        RK_S32 guard_cols;
+
+        /*
+         * VEPU580 只有对称 CME/RME 范围；保留完整 CME 搜索窗，在右侧强制帧内。
+         * CME 按 16 像素计；另留 1 个宏块给 RME 精修，并留 3 像素覆盖 H.264
+         * 六抽头亮度插值的最远右侧采样。该余量仍需板测确认。
+         */
+        guard_px = MPP_MAX(guard_px, 0);
+        guard_cols = (guard_px + 15) / 16;
+        end_px += guard_cols * 16;
+        start_px = MPP_MAX(start_px, 0);
+        end_px = MPP_MIN(end_px, (RK_S32)w);
         region->y = 0;
         region->h = h;
-        if (refresh_idx > 0) {
-            region->x = refresh_idx * 16 * refresh_num - 32;
-            region->w = 16 * refresh_num + 32;
-        } else {
-            region->x = refresh_idx * 16 * refresh_num;
-            region->w = 16 * refresh_num;
-        }
-        /* VEPU580 没有左右分向窗；列刷新时对全帧收紧水平 CME/RME 范围。 */
-        regs->reg_base.common.me_rnge.cme_srch_h = 1;
-        regs->reg_base.common.me_rnge.rme_srch_h = 3;
+        region->x = start_px;
+        region->w = MPP_MAX(end_px - start_px, 0);
     }
 
     region->intra = 1;
@@ -1542,7 +1577,7 @@ static MPP_RET setup_vepu580_intra_refresh(HalVepu580RegSet *regs, HalH264eVepu5
     regs->reg_base.common.roi_addr = base_cfg_fd;
     vepu5xx_h264_set_one_roi(base_cfg_buf, region, w, h);
     mpp_free(region);
-    mpp_buffer_sync_end(ctx->roi_base_cfg_buf);
+    mpp_buffer_sync_end(roi_base_cfg_buf);
 
 RET:
     hal_h264e_dbg_func("leave, ret %d\n", ret);
@@ -2135,8 +2170,12 @@ static MPP_RET hal_h264e_vepu580_gen_regs(void *hal, HalEncTask *task)
     setup_vepu580_split(regs, cfg);
     setup_vepu580_me(regs, sps, slice);
 
-    if (frm_status->is_i_refresh)
-        setup_vepu580_intra_refresh(regs, ctx, frm_status->seq_idx % cfg->rc.gop);
+    if (frm_status->is_i_refresh) {
+        ret = setup_vepu580_intra_refresh(regs, ctx, frm_status->seq_idx % cfg->rc.gop,
+                                          task->flags.reg_idx);
+        if (ret)
+            return ret;
+    }
 
     if (cfg->tune.deblur_en && (!rc_task->info.complex_scene) &&
         cfg->rc.rc_mode == MPP_ENC_RC_MODE_SMTRC &&
