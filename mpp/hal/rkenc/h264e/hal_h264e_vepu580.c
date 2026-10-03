@@ -1556,7 +1556,8 @@ static MPP_RET setup_vepu580_intra_refresh(HalVepu580RegSet *regs, HalH264eVepu5
          * 六抽头亮度插值的最远右侧采样。该余量仍需板测确认。
          */
         guard_px = MPP_MAX(guard_px, 0);
-        guard_cols = (guard_px + 15) / 16;
+        /* V2 样本仍有跨界，因此在估算余量外再多留一列宏块。 */
+        guard_cols = (guard_px + 15) / 16 + 1;
         end_px += guard_cols * 16;
         start_px = MPP_MAX(start_px, 0);
         end_px = MPP_MIN(end_px, (RK_S32)w);
